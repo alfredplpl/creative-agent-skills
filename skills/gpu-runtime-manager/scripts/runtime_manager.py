@@ -6,6 +6,7 @@ from pathlib import Path
 
 from gpu_runtime import (ConfigurationError, GPUOwner, RuntimeManager, error_payload,
                          load_config, setup_logging)
+from h3_workflow import build_h3_workflow_from_prompt_file
 
 
 def show(data: dict, json_mode: bool) -> None:
@@ -59,8 +60,15 @@ def parser() -> argparse.ArgumentParser:
         "run-video",
         help="atomically unload LLM, run one ComfyUI API workflow, and restore LLM",
     )
-    run_video.add_argument("--workflow", required=True,
-                           help="path to a ComfyUI API-format workflow JSON")
+    source = run_video.add_mutually_exclusive_group(required=True)
+    source.add_argument("--workflow", help="path to a ComfyUI API-format workflow JSON")
+    source.add_argument("--prompt-file",
+                        help="build the bundled MiniMax H3 workflow from this prompt")
+    run_video.add_argument("--width", type=int, default=864)
+    run_video.add_argument("--height", type=int, default=480)
+    run_video.add_argument("--duration", type=float, default=3.0)
+    run_video.add_argument("--seed", type=int)
+    run_video.add_argument("--output-prefix", default="video/minimax_h3")
     run_video.add_argument("--timeout", type=float,
                            help="workflow completion timeout in seconds")
     run_video.add_argument("--dry-run", action="store_true")
@@ -89,7 +97,14 @@ def main() -> int:
         if args.command == "status":
             result = manager.snapshot()
         elif args.command == "run-video":
-            workflow = load_workflow(args.workflow)
+            if args.workflow:
+                workflow = load_workflow(args.workflow)
+            else:
+                workflow = build_h3_workflow_from_prompt_file(
+                    args.prompt_file, width=args.width, height=args.height,
+                    duration=args.duration, seed=args.seed,
+                    output_prefix=args.output_prefix,
+                )
             with manager.locked():
                 result = manager.run_video_workflow(workflow, args.dry_run, args.timeout)
         else:

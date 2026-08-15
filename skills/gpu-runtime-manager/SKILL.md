@@ -1,6 +1,6 @@
 ---
 name: gpu-runtime-manager
-description: Safely manage exclusive ownership of one NVIDIA GPU between a llama.cpp LLM and ComfyUI video generation. Use before Qwen reasoning, before MiniMax H3 generation, after video generation, when returning to the LLM, or whenever GPU/VRAM ownership, runtime health, queue state, unloading, loading, or switching must be checked.
+description: Safely manage exclusive ownership of one NVIDIA GPU between a llama.cpp LLM and ComfyUI video generation, including building and atomically running the bundled MiniMax H3 text-to-video workflow. Use before Qwen reasoning, for MiniMax H3 generation from a prompt, after video generation, when returning to the LLM, or whenever GPU/VRAM ownership, runtime health, queue state, unloading, loading, or switching must be checked.
 ---
 
 # GPU Runtime Manager
@@ -22,6 +22,7 @@ Use this skill before every GPU-heavy workload, especially before using Qwen, be
 - Always let the manager verify actual GPU memory usage through NVML or `nvidia-smi`.
 - If GPU state is `UNKNOWN`, stop and report the status instead of loading another model.
 - For Creative Agent video requests, acquire LLM first and ask the configured llama.cpp model to create the complete H3 prompt before acquiring VIDEO. Use that model output as the workflow prompt; do not silently replace it with an agent-authored prompt.
+- Save the Qwen-generated H3 prompt to a UTF-8 text file and pass it to `run-video --prompt-file`. Let the bundled builder create the ComfyUI graph; do not ask the agent to invent node IDs or model bindings.
 - When OpenCode itself runs on the managed llama.cpp/Qwen model, use only the atomic `run-video` command for video generation. Never split VIDEO acquisition, submission, waiting, release, and LLM restoration across separate agent turns.
 - Treat standalone `acquire video` as an external-controller interface. Do not use it from an OpenCode session whose next inference also depends on the managed Qwen.
 - Run commands from the repository root. Use `--config PATH` before the subcommand only when selecting another config.
@@ -47,22 +48,29 @@ Use the LLM:
 python skills/gpu-runtime-manager/scripts/runtime_manager.py acquire llm
 ```
 
-Run video generation atomically when OpenCode uses the managed Qwen as its own model. Create the ComfyUI API-format workflow JSON while LLM is acquired, then make this the final tool call of the current Qwen turn:
+Run video generation atomically when OpenCode uses the managed Qwen as its own model. Save Qwen's complete H3 prompt to a text file while LLM is acquired, then make this the final tool call of the current Qwen turn:
 
 ```bash
 python skills/gpu-runtime-manager/scripts/runtime_manager.py run-video \
-  --workflow /tmp/minimax-h3-api-workflow.json
+  --prompt-file /tmp/minimax-h3-prompt.txt \
+  --width 864 \
+  --height 480 \
+  --duration 3 \
+  --output-prefix video/creative_agent \
+  --json
 ```
 
-The command holds the GPU lock while it unloads Qwen, verifies VRAM, submits and waits for that exact workflow, frees ComfyUI memory, verifies VRAM again, reloads Qwen, and only then returns control to OpenCode. Use `--json` for structured output or override the configured completion limit with `--timeout SECONDS`.
+The command builds the bundled MiniMax H3 text-to-video API graph, holds the GPU lock while it unloads Qwen, verifies VRAM, submits and waits for that exact workflow, frees ComfyUI memory, verifies VRAM again, reloads Qwen, and only then returns control to OpenCode. Defaults are 864x480 and 3 seconds. Width and height must be multiples of 32; duration must be at most 15 seconds. Override the configured completion limit with `--timeout SECONDS`.
 
 Preview the complete atomic operation without changing runtime state or submitting the workflow:
 
 ```bash
 python skills/gpu-runtime-manager/scripts/runtime_manager.py run-video \
-  --workflow /tmp/minimax-h3-api-workflow.json \
+  --prompt-file /tmp/minimax-h3-prompt.txt \
   --dry-run
 ```
+
+Use `--workflow FILE` only for an intentionally custom ComfyUI API-format graph. The normal H3 path does not require OpenCode to understand ComfyUI nodes.
 
 Use standalone ownership commands only from an external controller that does not depend on this Qwen for its next action:
 
@@ -83,8 +91,8 @@ python skills/gpu-runtime-manager/scripts/runtime_manager.py switch video llm
 
 1. Run `status` if ownership is not already known.
 2. For creative video generation, run `acquire llm`, ask the configured llama.cpp model to produce the complete H3 prompt, and retain its output for submission.
-3. Write a ComfyUI API-format workflow JSON containing that prompt while Qwen is still loaded. Do not pass a UI-format workflow export.
-4. If OpenCode uses this Qwen as its own model, invoke `run-video --workflow FILE` once. Do not call any other agent tool until it returns; the command performs the entire VIDEO lease and restores LLM internally.
+3. Save the exact prompt as a UTF-8 text file while Qwen is still loaded.
+4. If OpenCode uses this Qwen as its own model, invoke `run-video --prompt-file FILE` once. Do not call any other agent tool until it returns; the command builds the workflow, performs the entire VIDEO lease, and restores LLM internally.
 5. Stop if a manager command fails. Read the structured error and report the measured GPU processes and runtime states.
 6. Resume critique or planning only after the returned state reports `gpu_owner=llm` and `llama.model_loaded=true`.
 
@@ -118,8 +126,9 @@ User: "15秒のアニメPVを作って"
 
 acquire llm
   -> Qwen via llama.cpp generates the storyboard and complete H3 prompt
-  -> write ComfyUI API workflow JSON with that prompt
-  -> run-video --workflow ... (one OpenCode tool call)
+  -> save the H3 prompt to a UTF-8 text file
+  -> run-video --prompt-file ... (one OpenCode tool call)
+     -> manager builds the bundled MiniMax H3 API workflow
      -> manager unloads Qwen and verifies VRAM
      -> manager submits and waits for MiniMax H3
      -> manager releases VIDEO and verifies VRAM
@@ -138,4 +147,13 @@ python skills/gpu-runtime-manager/scripts/gpu_status.py --json
 python skills/gpu-runtime-manager/scripts/llama_status.py --json
 python skills/gpu-runtime-manager/scripts/comfy_status.py --json
 python skills/gpu-runtime-manager/scripts/wait_vram.py --free-mb 21000 --timeout 120
+```
+
+To inspect or hand off the generated API workflow without running it:
+
+```bash
+python skills/gpu-runtime-manager/scripts/prepare_h3_workflow.py \
+  --prompt-file /tmp/minimax-h3-prompt.txt \
+  --output /tmp/minimax-h3-api-workflow.json \
+  --width 864 --height 480 --duration 3
 ```
