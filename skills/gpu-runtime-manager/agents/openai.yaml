@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPU Runtime Manager"
+  short_description: "Safely switch one GPU between llama.cpp and ComfyUI"
+  default_prompt: "Use $gpu-runtime-manager to safely acquire or release the single GPU for the LLM or video runtime."

@@ -1,0 +1,53 @@
+gpu:
+  device: 0
+  poll_interval_seconds: 0.5
+  transition_timeout_seconds: 120
+  owner_process_threshold_mb: 1024
+
+# Match against NVML process name plus /proc command line, cwd, and executable.
+# A heavy process that matches neither list makes the owner UNKNOWN.
+process_detection:
+  llm_patterns:
+    - llama-server
+    - llama.cpp
+  video_patterns:
+    - comfyui
+
+llm:
+  runtime: llama.cpp
+  base_url: http://127.0.0.1:8080
+  model:
+    name: qwen3.8-27b
+  # Tune after measuring the configured GGUF. This value fits the local 24 GB GPU.
+  required_free_vram_mb: 18000
+  # auto prefers router /models/load and /models/unload. managed-process is
+  # permitted only for a process started and recorded by this manager.
+  management_mode: auto
+  startup_timeout_seconds: 120
+  managed_process:
+    command: []
+    cwd: ""
+    pid_file: /tmp/gpu-runtime-manager-llama.pid
+    log_file: /tmp/gpu-runtime-manager-llama.log
+
+video:
+  runtime: comfyui
+  base_url: http://127.0.0.1:8188
+  model:
+    name: minimax-h3
+  # MiniMax H3 relies on ComfyUI offload; reserve nearly all local 24 GB VRAM.
+  required_free_vram_mb: 22000
+  idle_timeout_seconds: 120
+
+fallback:
+  allow_runtime_restart: true
+
+lock:
+  path: /tmp/gpu-runtime-manager.lock
+  timeout_seconds: 30
+
+state:
+  path: /tmp/gpu-runtime-manager-state.json
+
+logging:
+  level: INFO
