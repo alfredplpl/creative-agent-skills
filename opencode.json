@@ -24,7 +24,11 @@
           },
           "options": {
             "temperature": 1.0,
-            "topP": 1.0
+            "topP": 1.0,
+            "reasoningEffort": "medium",
+            "chat_template_kwargs": {
+              "reasoning_effort": "medium"
+            }
           }
         }
       }
