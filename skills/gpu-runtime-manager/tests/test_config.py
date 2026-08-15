@@ -20,6 +20,12 @@ class ConfigTests(unittest.TestCase):
             path = Path(directory) / "bad.yaml"; path.write_text(yaml.safe_dump(data), encoding="utf-8")
             with self.assertRaises(ConfigurationError): load_config(path)
 
+    def test_invalid_workflow_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = config(directory); data["video"]["workflow_timeout_seconds"] = 0
+            path = Path(directory) / "bad.yaml"; path.write_text(yaml.safe_dump(data), encoding="utf-8")
+            with self.assertRaises(ConfigurationError): load_config(path)
+
     def test_required_vram_cannot_exceed_gpu_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
             data = config(directory); data["video"]["required_free_vram_mb"] = 99999

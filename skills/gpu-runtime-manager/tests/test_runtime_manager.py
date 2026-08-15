@@ -2,9 +2,10 @@ import tempfile
 import unittest
 
 from helpers import FakeEnvironment, config
-from gpu_runtime import (ComfyOperationError, ComfyUnavailable, GPUOwner,
+from gpu_runtime import (AtomicRecoveryError, ComfyOperationError, ComfyUnavailable, GPUOwner,
                          LlamaOperationError, LlamaUnavailable, RuntimeManager,
-                         UnexpectedGPUProcess, UnknownGPUState, VRAMTimeout, WorkflowBusy)
+                         UnexpectedGPUProcess, UnknownGPUState, VRAMTimeout, WorkflowBusy,
+                         WorkflowExecutionError, WorkflowSubmissionError)
 
 
 class RuntimeManagerTests(unittest.TestCase):
@@ -15,6 +16,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    @staticmethod
+    def workflow():
+        return {"1": {"class_type": "TestVideoNode", "inputs": {"prompt": "run"}}}
 
     def test_none_to_llm(self):
         result = self.manager.acquire(GPUOwner.LLM)
@@ -111,6 +116,66 @@ class RuntimeManagerTests(unittest.TestCase):
         result = self.manager.acquire(GPUOwner.LLM, dry_run=True)
         self.assertTrue(result["dry_run"])
         self.assertEqual(self.env.llama_state, "unloaded")
+
+    def test_atomic_video_restores_llm_after_success(self):
+        self.manager.acquire(GPUOwner.LLM)
+        result = self.manager.run_video_workflow(self.workflow())
+        self.assertEqual(result["gpu_owner"], "llm")
+        self.assertEqual(result["atomic_video"]["status"], "success")
+        self.assertEqual(result["atomic_video"]["files"][0]["filename"], "result.mp4")
+        self.assertEqual(self.env.submitted_workflow, {"prompt": self.workflow()})
+        paths = [call[1] for call in self.env.calls]
+        self.assertLess(paths.index("/models/unload"), paths.index("/prompt"))
+        self.assertLess(paths.index("/prompt"), paths.index("/free"))
+        self.assertLess(paths.index("/free"), len(paths) - 1 - paths[::-1].index("/models/load"))
+
+    def test_atomic_video_restores_llm_after_submission_failure(self):
+        self.manager.acquire(GPUOwner.LLM)
+        self.env.workflow_submit_fails = True
+        with self.assertRaises(WorkflowSubmissionError):
+            self.manager.run_video_workflow(self.workflow())
+        self.assertEqual(self.env.llama_state, "loaded")
+        self.assertFalse(self.env.video_loaded)
+
+    def test_atomic_video_restores_llm_after_node_validation_failure(self):
+        self.manager.acquire(GPUOwner.LLM)
+        self.env.workflow_node_errors = True
+        with self.assertRaises(WorkflowSubmissionError):
+            self.manager.run_video_workflow(self.workflow())
+        self.assertEqual(self.env.llama_state, "loaded")
+        self.assertFalse(self.env.video_loaded)
+
+    def test_atomic_video_restores_llm_after_execution_failure(self):
+        self.manager.acquire(GPUOwner.LLM)
+        self.env.workflow_status = "error"
+        with self.assertRaises(WorkflowExecutionError):
+            self.manager.run_video_workflow(self.workflow())
+        self.assertEqual(self.env.llama_state, "loaded")
+        self.assertFalse(self.env.video_loaded)
+
+    def test_atomic_video_does_not_restore_llm_while_workflow_is_busy(self):
+        self.manager.acquire(GPUOwner.LLM)
+        self.env.workflow_never_completes = True
+        with self.assertRaises(AtomicRecoveryError):
+            self.manager.run_video_workflow(self.workflow(), timeout=0.002)
+        self.assertEqual(self.env.llama_state, "unloaded")
+        self.assertEqual(self.env.comfy_running, 1)
+
+    def test_atomic_video_dry_run_does_not_submit_or_unload(self):
+        self.manager.acquire(GPUOwner.LLM)
+        result = self.manager.run_video_workflow(self.workflow(), dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(self.env.llama_state, "loaded")
+        self.assertNotIn("/prompt", [call[1] for call in self.env.calls])
+
+    def test_atomic_video_requires_llm_owner(self):
+        with self.assertRaises(UnknownGPUState):
+            self.manager.run_video_workflow(self.workflow())
+
+    def test_atomic_video_rejects_stale_persisted_llm_owner(self):
+        self.manager._persist(GPUOwner.LLM)
+        with self.assertRaises(UnknownGPUState):
+            self.manager.run_video_workflow(self.workflow())
 
 
 if __name__ == "__main__":

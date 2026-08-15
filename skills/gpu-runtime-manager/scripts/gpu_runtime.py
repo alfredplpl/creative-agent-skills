@@ -47,6 +47,10 @@ class LlamaOperationError(RuntimeManagerError): code = "llama_operation_failure"
 class ComfyUnavailable(RuntimeManagerError): code = "comfyui_unavailable"
 class ComfyOperationError(RuntimeManagerError): code = "comfyui_operation_failure"
 class WorkflowBusy(RuntimeManagerError): code = "workflow_still_running"
+class WorkflowSubmissionError(RuntimeManagerError): code = "workflow_submission_failure"
+class WorkflowExecutionError(RuntimeManagerError): code = "workflow_execution_failure"
+class WorkflowTimeout(RuntimeManagerError): code = "workflow_timeout"
+class AtomicRecoveryError(RuntimeManagerError): code = "atomic_recovery_failure"
 class UnexpectedGPUProcess(RuntimeManagerError): code = "unexpected_gpu_process"
 class UnknownGPUState(RuntimeManagerError): code = "unknown_gpu_state"
 class LockTimeout(RuntimeManagerError): code = "lock_timeout"
@@ -84,6 +88,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         value = data[section][key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise ConfigurationError(f"{section}.{key} must be positive")
+    workflow_timeout = data["video"].get("workflow_timeout_seconds", 3600)
+    if (isinstance(workflow_timeout, bool)
+            or not isinstance(workflow_timeout, (int, float))
+            or workflow_timeout <= 0):
+        raise ConfigurationError("video.workflow_timeout_seconds must be positive")
     for section, key in (("lock", "path"), ("state", "path")):
         value = data.get(section, {}).get(key)
         if value is not None and (not isinstance(value, str) or not Path(value).is_absolute()):
@@ -417,6 +426,69 @@ class RuntimeManager:
         if not after["reachable"]: raise ComfyUnavailable("ComfyUI became unavailable after cleanup")
         if not after["idle"]: raise WorkflowBusy("ComfyUI became busy during memory cleanup")
 
+    def _submit_comfy_workflow(self, workflow: dict[str, Any]) -> str:
+        if not isinstance(workflow, dict) or not workflow:
+            raise ConfigurationError("workflow must be a non-empty JSON object")
+        body = workflow if "prompt" in workflow else {"prompt": workflow}
+        if not isinstance(body.get("prompt"), dict) or not body["prompt"]:
+            raise ConfigurationError("workflow.prompt must be a non-empty ComfyUI API graph")
+        LOG.info("submitting_comfyui_workflow")
+        try:
+            response = self.http(self.cfg["video"]["base_url"], "/prompt", "POST", body)
+        except RuntimeManagerError as exc:
+            raise WorkflowSubmissionError(str(exc)) from exc
+        if not isinstance(response, dict) or not response.get("prompt_id"):
+            raise WorkflowSubmissionError(f"ComfyUI did not return prompt_id: {response}")
+        if response.get("node_errors"):
+            raise WorkflowSubmissionError(f"ComfyUI rejected workflow: {response['node_errors']}")
+        prompt_id = str(response["prompt_id"])
+        LOG.info("comfyui_workflow_submitted prompt_id=%s", prompt_id)
+        return prompt_id
+
+    @staticmethod
+    def _workflow_files(outputs: Any) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if isinstance(value.get("filename"), str):
+                    files.append({key: value[key] for key in ("filename", "subfolder", "type")
+                                  if key in value})
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(outputs)
+        return files
+
+    def _wait_comfy_workflow(self, prompt_id: str, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        path = f"/history/{prompt_id}"
+        while True:
+            try:
+                history = self.http(self.cfg["video"]["base_url"], path)
+            except RuntimeManagerError as exc:
+                raise ComfyUnavailable(f"ComfyUI became unavailable while waiting: {exc}") from exc
+            item = history.get(prompt_id) if isinstance(history, dict) else None
+            if isinstance(item, dict):
+                status = item.get("status", {})
+                if status.get("completed"):
+                    if status.get("status_str") != "success":
+                        raise WorkflowExecutionError(
+                            f"ComfyUI workflow {prompt_id} failed: {status}"
+                        )
+                    LOG.info("comfyui_workflow_completed prompt_id=%s", prompt_id)
+                    return {"prompt_id": prompt_id, "status": "success",
+                            "files": self._workflow_files(item.get("outputs", {}))}
+            if time.monotonic() >= deadline:
+                raise WorkflowTimeout(
+                    f"timed out waiting for ComfyUI workflow {prompt_id} after {timeout:g} seconds"
+                )
+            time.sleep(min(self.cfg["gpu"]["poll_interval_seconds"],
+                           max(0.0, deadline - time.monotonic())))
+
     def _llama_unload(self) -> None:
         status = llama_status(self.cfg, self.http)
         if not status["reachable"]: raise LlamaUnavailable("llama-server is unavailable")
@@ -575,6 +647,65 @@ class RuntimeManager:
         if result["detected_state"] != GPUOwner.NONE.value:
             raise RuntimeManagerError(f"runtime released but detected_state={result['detected_state']}")
         LOG.info("owner=NONE"); return result
+
+    def run_video_workflow(self, workflow: dict[str, Any], dry_run: bool = False,
+                           timeout: float | None = None) -> dict[str, Any]:
+        before = self.snapshot()
+        llama = before["llama"]
+        if (before["detected_state"] != GPUOwner.LLM.value
+                or not llama["healthy"]
+                or not llama["model_loaded"]
+                or llama.get("sleeping")):
+            raise UnknownGPUState(
+                "atomic run-video must start with healthy, measured LLM ownership "
+                "so OpenCode can resume safely"
+            )
+        workflow_timeout = (self.cfg["video"].get("workflow_timeout_seconds", 3600)
+                            if timeout is None else timeout)
+        if (isinstance(workflow_timeout, bool)
+                or not isinstance(workflow_timeout, (int, float))
+                or workflow_timeout <= 0):
+            raise ConfigurationError("workflow timeout must be positive")
+        if not isinstance(workflow, dict) or not workflow:
+            raise ConfigurationError("workflow must be a non-empty JSON object")
+        body = workflow if "prompt" in workflow else {"prompt": workflow}
+        if not isinstance(body.get("prompt"), dict) or not body["prompt"]:
+            raise ConfigurationError("workflow.prompt must be a non-empty ComfyUI API graph")
+        if dry_run:
+            preview = self.acquire(GPUOwner.VIDEO, True)
+            return {"dry_run": True, "target": "video_then_llm", "current": before,
+                    "would": preview["would"] + [
+                        "submit the ComfyUI API workflow",
+                        f"wait up to {workflow_timeout:g} seconds for that exact workflow",
+                        "wait for ComfyUI idle and free video models",
+                        "verify actual VRAM release",
+                        "load Qwen and verify llama-server readiness",
+                        "return control to OpenCode only after owner is LLM",
+                    ]}
+
+        try:
+            self.acquire(GPUOwner.VIDEO)
+            prompt_id = self._submit_comfy_workflow(body)
+            workflow_result = self._wait_comfy_workflow(prompt_id, float(workflow_timeout))
+        except BaseException as primary_error:
+            try:
+                self.release(GPUOwner.VIDEO)
+                self.acquire(GPUOwner.LLM)
+            except Exception as recovery_error:
+                raise AtomicRecoveryError(
+                    f"video operation failed ({primary_error}); LLM recovery also failed "
+                    f"({recovery_error}); do not request another model until status is inspected"
+                ) from recovery_error
+            raise
+
+        try:
+            self.release(GPUOwner.VIDEO)
+            restored = self.acquire(GPUOwner.LLM)
+        except Exception as recovery_error:
+            raise AtomicRecoveryError(
+                f"video workflow succeeded but LLM recovery failed: {recovery_error}"
+            ) from recovery_error
+        return {**restored, "atomic_video": workflow_result}
 
     def locked(self) -> FileLock:
         return FileLock(self.cfg["lock"]["path"], self.cfg["lock"].get("timeout_seconds", 30))

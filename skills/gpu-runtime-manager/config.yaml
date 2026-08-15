@@ -38,6 +38,8 @@ video:
   # MiniMax H3 relies on ComfyUI offload; reserve nearly all local 24 GB VRAM.
   required_free_vram_mb: 21000
   idle_timeout_seconds: 120
+  # Atomic run-video waits for one submitted workflow, then restores the LLM.
+  workflow_timeout_seconds: 3600
 
 fallback:
   allow_runtime_restart: true

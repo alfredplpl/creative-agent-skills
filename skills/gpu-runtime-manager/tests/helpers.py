@@ -18,7 +18,7 @@ def config(temp_dir: str) -> dict:
                 "startup_timeout_seconds": 0.03, "managed_process": {"command": []}},
         "video": {"runtime": "comfyui", "base_url": "http://comfy",
                   "model": {"name": "minimax-h3"}, "required_free_vram_mb": 22000,
-                  "idle_timeout_seconds": 0.02},
+                  "idle_timeout_seconds": 0.02, "workflow_timeout_seconds": 0.02},
         "fallback": {"allow_runtime_restart": False},
         "lock": {"path": str(Path(temp_dir) / "manager.lock"), "timeout_seconds": 0.05},
         "state": {"path": str(Path(temp_dir) / "state.json")},
@@ -40,6 +40,12 @@ class FakeEnvironment:
         self.free_fails = False
         self.retain_video_memory = False
         self.rogue_process = False
+        self.workflow_submit_fails = False
+        self.workflow_node_errors = False
+        self.workflow_status = "success"
+        self.workflow_polls_remaining = 0
+        self.workflow_never_completes = False
+        self.submitted_workflow = None
         self.calls = []
 
     def monitor(self, _index):
@@ -85,6 +91,27 @@ class FakeEnvironment:
                 return {"queue_running": [[1]] * self.comfy_running,
                         "queue_pending": [[2]] * self.comfy_pending}
             if path == "/system_stats": return {"system": {"comfyui_version": "test"}}
+            if path == "/prompt":
+                if self.workflow_submit_fails: raise RuntimeManagerError("submit failed")
+                self.submitted_workflow = copy.deepcopy(payload)
+                if self.workflow_node_errors:
+                    return {"prompt_id": "prompt-1", "node_errors": {"7": "invalid"}}
+                self.video_loaded = True
+                self.comfy_running = 1
+                return {"prompt_id": "prompt-1", "node_errors": {}}
+            if path == "/history/prompt-1":
+                if self.workflow_polls_remaining > 0:
+                    self.workflow_polls_remaining -= 1
+                    return {}
+                if self.workflow_never_completes:
+                    return {}
+                self.comfy_running = 0
+                return {"prompt-1": {
+                    "status": {"completed": True, "status_str": self.workflow_status},
+                    "outputs": {"9": {"videos": [{"filename": "result.mp4",
+                                                       "subfolder": "video",
+                                                       "type": "output"}]}},
+                }}
             if path.startswith("/history"): return {}
             if path == "/free":
                 if self.free_fails: raise RuntimeManagerError("free failed")

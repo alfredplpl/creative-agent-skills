@@ -1,6 +1,37 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "llamacpp/qwen-3.8-27B",
   "skills": {
     "paths": ["./skills"]
+  },
+  "provider": {
+    "llamacpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local llama.cpp",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen-3.8-27B": {
+          "name": "Qwen 3.8 27B",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 1.0,
+            "topP": 1.0
+          }
+        }
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "bash": "ask"
   }
 }

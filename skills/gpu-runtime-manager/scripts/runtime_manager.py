@@ -2,8 +2,10 @@
 """High-level CLI for safe single-GPU runtime transitions."""
 import argparse
 import json
+from pathlib import Path
 
-from gpu_runtime import GPUOwner, RuntimeManager, error_payload, load_config, setup_logging
+from gpu_runtime import (ConfigurationError, GPUOwner, RuntimeManager, error_payload,
+                         load_config, setup_logging)
 
 
 def show(data: dict, json_mode: bool) -> None:
@@ -25,6 +27,12 @@ def show(data: dict, json_mode: bool) -> None:
     print(f"llama.cpp: {llama_text}")
     print(f"ComfyUI: {comfy_text}")
     print(f"State: {data['detected_state'].upper()}")
+    if data.get("atomic_video"):
+        workflow = data["atomic_video"]
+        print(f"Workflow: {workflow['status']} ({workflow['prompt_id']})")
+        for item in workflow.get("files", []):
+            path = "/".join(part for part in (item.get("subfolder"), item.get("filename")) if part)
+            print(f"Output: {path}")
     if data.get("unexpected_processes"):
         print("Unexpected GPU processes:")
         for process in data["unexpected_processes"]:
@@ -47,7 +55,27 @@ def parser() -> argparse.ArgumentParser:
     switch.add_argument("target", choices=("llm", "video"))
     switch.add_argument("--dry-run", action="store_true")
     switch.add_argument("--json", action="store_true")
+    run_video = commands.add_parser(
+        "run-video",
+        help="atomically unload LLM, run one ComfyUI API workflow, and restore LLM",
+    )
+    run_video.add_argument("--workflow", required=True,
+                           help="path to a ComfyUI API-format workflow JSON")
+    run_video.add_argument("--timeout", type=float,
+                           help="workflow completion timeout in seconds")
+    run_video.add_argument("--dry-run", action="store_true")
+    run_video.add_argument("--json", action="store_true")
     return root
+
+
+def load_workflow(path: str) -> dict:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"cannot read workflow {path}: {exc}") from exc
+    if not isinstance(value, dict) or not value:
+        raise ConfigurationError("workflow must be a non-empty JSON object")
+    return value
 
 
 def main() -> int:
@@ -60,6 +88,10 @@ def main() -> int:
         manager = RuntimeManager(cfg)
         if args.command == "status":
             result = manager.snapshot()
+        elif args.command == "run-video":
+            workflow = load_workflow(args.workflow)
+            with manager.locked():
+                result = manager.run_video_workflow(workflow, args.dry_run, args.timeout)
         else:
             with manager.locked():
                 if args.command == "acquire":
