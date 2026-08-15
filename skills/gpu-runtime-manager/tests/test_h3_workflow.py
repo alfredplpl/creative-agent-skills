@@ -5,7 +5,9 @@ from pathlib import Path
 
 from helpers import SCRIPTS  # noqa: F401
 from gpu_runtime import ConfigurationError
-from h3_workflow import build_h3_workflow, build_h3_workflow_from_prompt_file, write_workflow
+from h3_workflow import (REFERENCE_UNET, build_h3_reference_workflow,
+                         build_h3_workflow, build_h3_workflow_from_prompt_file,
+                         set_h3_reference_image, write_workflow)
 
 
 def node(graph, class_type):
@@ -39,6 +41,41 @@ class H3WorkflowTests(unittest.TestCase):
         seed = node(graph, "RandomNoise")["inputs"]["noise_seed"]
         self.assertGreaterEqual(seed, 0)
         self.assertLess(seed, 2**64)
+
+    def test_builds_single_image_reference_workflow(self):
+        graph = build_h3_reference_workflow(
+            "Use <Picture 1> as the exact character identity. She starts sprinting.",
+            "gpu-runtime-manager/character.png", reference_quality="max", seed=321,
+        )
+        video = node(graph, "MiniMaxH3ReferenceToVideo")["inputs"]
+        image_id = video["ref_images.ref_image_0"][0]
+        self.assertEqual(graph[image_id]["class_type"], "LoadImage")
+        self.assertEqual(graph[image_id]["inputs"]["image"],
+                         "gpu-runtime-manager/character.png")
+        self.assertEqual(video["ref_image_size"], "max")
+        self.assertEqual(video["audio_vae"], ["105:24", 0])
+        self.assertEqual(node(graph, "UNETLoader")["inputs"]["unet_name"], REFERENCE_UNET)
+        self.assertFalse(any(item.get("class_type") == "MiniMaxH3ImageToVideo"
+                             for item in graph.values()))
+
+    def test_reference_workflow_requires_picture_tag_and_safe_image_name(self):
+        invalid = [
+            ("character runs", "character.png", "match"),
+            ("Use <Picture 1>", "../character.png", "match"),
+            ("Use <Picture 1>", "character.png", "ultra"),
+        ]
+        for prompt, image, quality in invalid:
+            with self.subTest(prompt=prompt, image=image, quality=quality):
+                with self.assertRaises(ConfigurationError):
+                    build_h3_reference_workflow(
+                        prompt, image, reference_quality=quality
+                    )
+
+    def test_replaces_reference_image_after_upload(self):
+        graph = build_h3_reference_workflow("Use <Picture 1>.", "placeholder.png")
+        set_h3_reference_image(graph, "gpu-runtime-manager/uploaded.png")
+        self.assertEqual(node(graph, "LoadImage")["inputs"]["image"],
+                         "gpu-runtime-manager/uploaded.png")
 
     def test_rejects_invalid_generation_values(self):
         invalid = [

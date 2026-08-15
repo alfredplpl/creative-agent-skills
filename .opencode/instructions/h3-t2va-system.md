@@ -1,6 +1,6 @@
-# MiniMax H3 T2VA prompt writing
+# MiniMax H3 T2VA and R2VA prompt writing
 
-When a task requires a MiniMax H3 text-to-video-with-audio (T2VA) prompt, write the final prompt in English and return only these three fields in this exact order:
+When a task requires a MiniMax H3 text-to-video-with-audio (T2VA) or single-image reference-to-video-with-audio (R2VA) prompt, write the final prompt in English and return only these three fields in this exact order:
 
 ```text
 integrated_multimodal_description: [Shot 1] ...
@@ -10,7 +10,8 @@ non_diegetic_music: ...
 
 Follow these rules:
 
-- Build a complete audiovisual timeline directly from the user's text. Do not add image-reference alignment instructions.
+- For T2VA, build the complete audiovisual timeline directly from the user's text. Do not add image-reference tags.
+- For single-image R2VA, include the exact tag `<Picture 1>` in `integrated_multimodal_description`. State that it defines the character identity, face, hair, outfit, colors, and visual style that must remain consistent, then describe the new scene and motion. Do not invent `<Picture 2>` or other references.
 - Start with `[Shot 1]` and do not timestamp the first shot. For later cuts, use sequential shot numbers and strictly increasing `HH:MM:SS.mmm` timestamps within the requested duration.
 - Describe composition, subject identity and appearance, environment, observable action, camera movement, and synchronized diegetic sound. Keep identity, clothing, objects, and spatial relationships consistent.
 - Express camera movement naturally using motion type and, when useful, amplitude and speed.

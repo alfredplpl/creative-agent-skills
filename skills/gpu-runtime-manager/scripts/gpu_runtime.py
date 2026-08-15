@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import enum
 import fcntl
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import signal
 import subprocess
@@ -46,6 +48,7 @@ class LlamaUnavailable(RuntimeManagerError): code = "llama_server_unavailable"
 class LlamaOperationError(RuntimeManagerError): code = "llama_operation_failure"
 class ComfyUnavailable(RuntimeManagerError): code = "comfyui_unavailable"
 class ComfyOperationError(RuntimeManagerError): code = "comfyui_operation_failure"
+class ComfyUploadError(RuntimeManagerError): code = "reference_image_upload_failure"
 class WorkflowBusy(RuntimeManagerError): code = "workflow_still_running"
 class WorkflowSubmissionError(RuntimeManagerError): code = "workflow_submission_failure"
 class WorkflowExecutionError(RuntimeManagerError): code = "workflow_execution_failure"
@@ -242,6 +245,68 @@ def request_json(base: str, path: str, method: str = "GET",
         raise RuntimeManagerError(f"HTTP {method} {path} failed: {exc}") from exc
 
 
+def validate_reference_image(path: str | Path) -> Path:
+    source = Path(path)
+    supported = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif"}
+    try:
+        if not source.is_file():
+            raise ComfyUploadError(f"reference image is not a file: {source}")
+        if source.stat().st_size <= 0:
+            raise ComfyUploadError(f"reference image is empty: {source}")
+    except OSError as exc:
+        raise ComfyUploadError(f"cannot inspect reference image {source}: {exc}") from exc
+    if source.suffix.lower() not in supported:
+        raise ComfyUploadError(
+            f"unsupported reference image extension {source.suffix or '(none)'}"
+        )
+    return source
+
+
+def upload_comfy_image(cfg: dict[str, Any], path: str | Path) -> str:
+    """Upload one local image to ComfyUI and return its LoadImage-relative name."""
+    source = validate_reference_image(path)
+    try:
+        content = source.read_bytes()
+    except OSError as exc:
+        raise ComfyUploadError(f"cannot read reference image {source}: {exc}") from exc
+
+    suffix = source.suffix.lower()
+    upload_name = f"reference-{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+    boundary = f"gpu-runtime-manager-{os.urandom(12).hex()}"
+    mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+    parts = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"type\"\r\n\r\ninput\r\n".encode(),
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"subfolder\"\r\n\r\n"
+         "gpu-runtime-manager\r\n").encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n".encode(),
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; "
+         f"filename=\"{upload_name}\"\r\nContent-Type: {mime_type}\r\n\r\n").encode(),
+        content,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    request = urllib.request.Request(
+        cfg["video"]["base_url"].rstrip("/") + "/upload/image",
+        data=b"".join(parts), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read())
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise ComfyUploadError(f"ComfyUI reference image upload failed: {exc}") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("name"), str):
+        raise ComfyUploadError(f"invalid ComfyUI upload response: {result}")
+    subfolder = result.get("subfolder", "")
+    if not isinstance(subfolder, str):
+        raise ComfyUploadError(f"invalid ComfyUI upload subfolder: {result}")
+    relative = Path(subfolder, result["name"]).as_posix() if subfolder else result["name"]
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ComfyUploadError(f"unsafe ComfyUI upload response: {result}")
+    LOG.info("comfyui_reference_uploaded image=%s", relative)
+    return relative
+
+
 def llama_status(cfg: dict[str, Any], http: Callable[..., Any] = request_json) -> dict[str, Any]:
     base, wanted = cfg["llm"]["base_url"], cfg["llm"]["model"]["name"]
     result: dict[str, Any] = {"reachable": False, "healthy": False, "router_mode": False,
@@ -365,6 +430,26 @@ class RuntimeManager:
     cfg: dict[str, Any]
     monitor: Callable[[int], dict[str, Any]] = gpu_status
     http: Callable[..., Any] = request_json
+
+    def _atomic_start_snapshot(self) -> dict[str, Any]:
+        before = self.snapshot()
+        llama = before["llama"]
+        if (before["detected_state"] != GPUOwner.LLM.value
+                or not llama["healthy"]
+                or not llama["model_loaded"]
+                or llama.get("sleeping")):
+            raise UnknownGPUState(
+                "atomic run-video must start with healthy, measured LLM ownership "
+                "so OpenCode can resume safely"
+            )
+        return before
+
+    def upload_reference_image(self, path: str | Path) -> str:
+        """Validate atomic start state before making a lightweight ComfyUI upload."""
+        self._atomic_start_snapshot()
+        if not comfy_status(self.cfg, self.http)["reachable"]:
+            raise ComfyUnavailable("ComfyUI is unavailable")
+        return upload_comfy_image(self.cfg, path)
 
     def _read_persisted_owner(self) -> GPUOwner | None:
         path = Path(self.cfg.get("state", {}).get("path", "/tmp/gpu-runtime-manager-state.json"))
@@ -650,16 +735,7 @@ class RuntimeManager:
 
     def run_video_workflow(self, workflow: dict[str, Any], dry_run: bool = False,
                            timeout: float | None = None) -> dict[str, Any]:
-        before = self.snapshot()
-        llama = before["llama"]
-        if (before["detected_state"] != GPUOwner.LLM.value
-                or not llama["healthy"]
-                or not llama["model_loaded"]
-                or llama.get("sleeping")):
-            raise UnknownGPUState(
-                "atomic run-video must start with healthy, measured LLM ownership "
-                "so OpenCode can resume safely"
-            )
+        before = self._atomic_start_snapshot()
         workflow_timeout = (self.cfg["video"].get("workflow_timeout_seconds", 3600)
                             if timeout is None else timeout)
         if (isinstance(workflow_timeout, bool)

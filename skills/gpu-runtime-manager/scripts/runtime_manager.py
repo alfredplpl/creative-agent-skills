@@ -5,8 +5,13 @@ import json
 from pathlib import Path
 
 from gpu_runtime import (ConfigurationError, GPUOwner, RuntimeManager, error_payload,
-                         load_config, setup_logging)
-from h3_workflow import build_h3_workflow_from_prompt_file
+                         load_config, setup_logging, validate_reference_image)
+from h3_workflow import (REFERENCE_IMAGE_PLACEHOLDER,
+                         build_h3_reference_workflow_from_prompt_file,
+                         build_h3_workflow_from_prompt_file,
+                         set_h3_reference_image)
+from opencode_attachment import (cleanup_staged_attachment,
+                                 resolve_opencode_attachment)
 
 
 def show(data: dict, json_mode: bool) -> None:
@@ -69,6 +74,21 @@ def parser() -> argparse.ArgumentParser:
     run_video.add_argument("--duration", type=float, default=3.0)
     run_video.add_argument("--seed", type=int)
     run_video.add_argument("--output-prefix", default="video/minimax_h3")
+    reference = run_video.add_mutually_exclusive_group()
+    reference.add_argument(
+        "--reference-image",
+        help="local character/style image; enables MiniMax H3 reference-to-video",
+    )
+    reference.add_argument(
+        "--opencode-attachment", nargs="?", const="", metavar="FILENAME",
+        help="use an OpenCode user image attachment (default: latest in active session)",
+    )
+    run_video.add_argument(
+        "--reference-quality", choices=("match", "max"), default="match",
+        help="match is faster; max preserves more reference detail",
+    )
+    run_video.add_argument("--opencode-session", help="disambiguate the OpenCode session")
+    run_video.add_argument("--opencode-db", help="override the OpenCode database path")
     run_video.add_argument("--timeout", type=float,
                            help="workflow completion timeout in seconds")
     run_video.add_argument("--dry-run", action="store_true")
@@ -90,6 +110,7 @@ def main() -> int:
     args = parser().parse_args()
     json_mode = getattr(args, "json", False)
     manager = None
+    staged_attachment = None
     try:
         cfg = load_config(args.config)
         setup_logging(cfg, json_mode)
@@ -97,8 +118,38 @@ def main() -> int:
         if args.command == "status":
             result = manager.snapshot()
         elif args.command == "run-video":
+            attachment_metadata = None
+            reference_image = args.reference_image
+            if args.opencode_attachment is not None:
+                staged_attachment, attachment_metadata = resolve_opencode_attachment(
+                    args.opencode_attachment or None,
+                    session_id=args.opencode_session,
+                    database=args.opencode_db,
+                )
+                reference_image = str(staged_attachment)
+            elif args.opencode_session or args.opencode_db:
+                raise ConfigurationError(
+                    "--opencode-session and --opencode-db require --opencode-attachment"
+                )
+            if args.workflow and reference_image:
+                raise ConfigurationError(
+                    "reference images are supported with --prompt-file, not --workflow"
+                )
+            if args.reference_quality != "match" and not reference_image:
+                raise ConfigurationError(
+                    "--reference-quality requires a reference image"
+                )
+            if reference_image:
+                validate_reference_image(reference_image)
             if args.workflow:
                 workflow = load_workflow(args.workflow)
+            elif reference_image:
+                workflow = build_h3_reference_workflow_from_prompt_file(
+                    args.prompt_file, REFERENCE_IMAGE_PLACEHOLDER,
+                    reference_quality=args.reference_quality,
+                    width=args.width, height=args.height, duration=args.duration,
+                    seed=args.seed, output_prefix=args.output_prefix,
+                )
             else:
                 workflow = build_h3_workflow_from_prompt_file(
                     args.prompt_file, width=args.width, height=args.height,
@@ -106,7 +157,22 @@ def main() -> int:
                     output_prefix=args.output_prefix,
                 )
             with manager.locked():
+                uploaded_image = None
+                if reference_image and not args.dry_run:
+                    uploaded_image = manager.upload_reference_image(reference_image)
+                    set_h3_reference_image(workflow, uploaded_image)
                 result = manager.run_video_workflow(workflow, args.dry_run, args.timeout)
+                if reference_image:
+                    if args.dry_run:
+                        label = (f"OpenCode attachment {attachment_metadata['filename']}"
+                                 if attachment_metadata else f"reference image {reference_image}")
+                        result["would"].insert(
+                            0, f"upload {label} to ComfyUI"
+                        )
+                    else:
+                        result["atomic_video"]["reference_image"] = uploaded_image
+                        if attachment_metadata:
+                            result["atomic_video"]["opencode_attachment"] = attachment_metadata
         else:
             with manager.locked():
                 if args.command == "acquire":
@@ -134,6 +200,9 @@ def main() -> int:
         else:
             print(f"ERROR [{payload['error']}]: {payload['message']}")
         return 1
+    finally:
+        if staged_attachment is not None:
+            cleanup_staged_attachment(staged_attachment)
 
 
 if __name__ == "__main__":

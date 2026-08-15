@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 
 from helpers import FakeEnvironment, config
 from gpu_runtime import (AtomicRecoveryError, ComfyOperationError, ComfyUnavailable, GPUOwner,
@@ -176,6 +177,20 @@ class RuntimeManagerTests(unittest.TestCase):
         self.manager._persist(GPUOwner.LLM)
         with self.assertRaises(UnknownGPUState):
             self.manager.run_video_workflow(self.workflow())
+
+    def test_reference_upload_happens_only_from_measured_llm_state(self):
+        with mock.patch("gpu_runtime.upload_comfy_image") as upload:
+            with self.assertRaises(UnknownGPUState):
+                self.manager.upload_reference_image("character.png")
+            upload.assert_not_called()
+
+            self.manager.acquire(GPUOwner.LLM)
+            upload.return_value = "gpu-runtime-manager/reference.png"
+            result = self.manager.upload_reference_image("character.png")
+
+        self.assertEqual(result, "gpu-runtime-manager/reference.png")
+        self.assertEqual(self.env.llama_state, "loaded")
+        self.assertNotEqual(self.env.calls[-1][1], "/models/unload")
 
 
 if __name__ == "__main__":
