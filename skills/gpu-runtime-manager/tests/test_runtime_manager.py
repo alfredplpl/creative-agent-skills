@@ -32,6 +32,13 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(result["gpu_owner"], "video")
         self.assertEqual(self.env.llama_state, "unloaded")
 
+    def test_llm_to_video_waits_for_async_router_unload(self):
+        self.manager.acquire(GPUOwner.LLM)
+        self.env.unload_polls_remaining = 3
+        result = self.manager.acquire(GPUOwner.VIDEO)
+        self.assertEqual(result["gpu_owner"], "video")
+        self.assertEqual(self.env.llama_state, "unloaded")
+
     def test_video_to_llm(self):
         self.manager.acquire(GPUOwner.VIDEO)
         self.env.video_loaded = True

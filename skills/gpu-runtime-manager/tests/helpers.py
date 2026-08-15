@@ -36,6 +36,7 @@ class FakeEnvironment:
         self.comfy_pending = 0
         self.load_fails = False
         self.unload_fails = False
+        self.unload_polls_remaining = 0
         self.free_fails = False
         self.retain_video_memory = False
         self.rogue_process = False
@@ -65,13 +66,18 @@ class FakeEnvironment:
                 raise RuntimeManagerError("llama unreachable")
             if path == "/health": return {"status": "ok"}
             if path == "/models":
+                if self.llama_state == "unloading" and self.unload_polls_remaining > 0:
+                    self.unload_polls_remaining -= 1
+                    if self.unload_polls_remaining == 0:
+                        self.llama_state = "unloaded"
                 return {"data": [{"id": "qwen", "status": {"value": self.llama_state}}]}
             if path == "/models/load":
                 if self.load_fails: raise RuntimeManagerError("load failed")
                 self.llama_state = "loaded"; return {"success": True}
             if path == "/models/unload":
                 if self.unload_fails: raise RuntimeManagerError("unload failed")
-                self.llama_state = "unloaded"; return {"success": True}
+                self.llama_state = "unloading" if self.unload_polls_remaining else "unloaded"
+                return {"success": True}
         if base == "http://comfy":
             if not self.comfy_reachable:
                 raise RuntimeManagerError("ComfyUI unreachable")

@@ -429,7 +429,17 @@ class RuntimeManager:
             except RuntimeManagerError as exc: raise LlamaOperationError(str(exc)) from exc
             if isinstance(response, dict) and response.get("success") is False:
                 raise LlamaOperationError(f"llama unload rejected: {response}")
-            return
+            deadline = time.monotonic() + self.cfg["gpu"]["transition_timeout_seconds"]
+            last = status
+            while time.monotonic() < deadline:
+                last = llama_status(self.cfg, self.http)
+                if (last["reachable"] and not last["model_loaded"]
+                        and last.get("model_state") not in {"loading", "unloading"}):
+                    return
+                time.sleep(self.cfg["gpu"]["poll_interval_seconds"])
+            raise LlamaOperationError(
+                f"llama model did not finish unloading before timeout; last_status={last}"
+            )
         self._stop_managed_llama()
 
     def _llama_load(self) -> None:
@@ -525,6 +535,14 @@ class RuntimeManager:
             if current is GPUOwner.LLM: self._llama_unload()
             self._wait_vram(int(self.cfg["video"]["required_free_vram_mb"]))
             if not comfy_status(self.cfg, self.http)["reachable"]: raise ComfyUnavailable("ComfyUI is unavailable")
+        if target is GPUOwner.VIDEO:
+            verification = self.snapshot()
+            if verification["unexpected_processes"]:
+                raise UnexpectedGPUProcess("unexpected heavy GPU process appeared during transition")
+            if verification["detected_state"] == GPUOwner.UNKNOWN.value:
+                raise UnknownGPUState("GPU became UNKNOWN during VIDEO transition")
+            if verification["llama"]["model_loaded"] or verification["detected_state"] == GPUOwner.LLM.value:
+                raise LlamaOperationError("llama is still active after VIDEO transition")
         self._persist(target); result = self.snapshot()
         if target is GPUOwner.LLM and not (result["llama"]["healthy"] and result["llama"]["model_loaded"] and not result["llama"].get("sleeping")):
             raise LlamaOperationError("llama readiness verification failed")

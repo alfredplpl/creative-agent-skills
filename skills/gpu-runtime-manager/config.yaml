@@ -17,7 +17,7 @@ llm:
   runtime: llama.cpp
   base_url: http://127.0.0.1:8080
   model:
-    name: qwen3.8-27b
+    name: qwen-3.8-27B
   # Tune after measuring the configured GGUF. This value fits the local 24 GB GPU.
   required_free_vram_mb: 18000
   # auto prefers router /models/load and /models/unload. managed-process is
@@ -36,7 +36,7 @@ video:
   model:
     name: minimax-h3
   # MiniMax H3 relies on ComfyUI offload; reserve nearly all local 24 GB VRAM.
-  required_free_vram_mb: 22000
+  required_free_vram_mb: 21000
   idle_timeout_seconds: 120
 
 fallback:
